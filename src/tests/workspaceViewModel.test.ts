@@ -1,12 +1,24 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { analyzeRules } from '../domain/ruleAnalysis';
-import type { RuleProject, WorkspaceDocument } from '../models/ruleModel';
+import type { RuleProject, WorkspaceDocument, WorkspaceLoadResult } from '../models/ruleModel';
 import type { CheckOperation } from '../services/ruleCheckService';
 import { RuleWorkspaceViewModel } from '../viewmodels/workspaceViewModel';
 
 class MemoryRepository {
   document: WorkspaceDocument | null = null;
   async load() { return this.document ? structuredClone(this.document) : null; }
+  async prepareRecoveredSourcesForSave() { return undefined; }
+  async save(document: WorkspaceDocument) { this.document = structuredClone(document); }
+}
+
+class RecoveredRepository {
+  document: WorkspaceDocument | null = null;
+  backupPrepared = false;
+
+  constructor(private readonly recovered: WorkspaceLoadResult) {}
+
+  async load() { return structuredClone(this.recovered); }
+  async prepareRecoveredSourcesForSave() { this.backupPrepared = true; }
   async save(document: WorkspaceDocument) { this.document = structuredClone(document); }
 }
 
@@ -49,6 +61,45 @@ describe('RuleWorkspaceViewModel', () => {
     await restored.start();
     expect(restored.getSnapshot().project?.title).toBe('已修改策略');
     restored.dispose();
+    workspace.dispose();
+  });
+
+  it('locks writes until damaged raw data has been explicitly backed up', async () => {
+    const project: RuleProject = {
+      id: 'damaged-save-source', title: '用户项目',
+      fields: [{ id: 'amount', name: '金额', type: 'number', min: 0, max: 100 }],
+      rules: [{
+        id: 'amount-rule', name: '大额', priority: 10, result: '通过',
+        conditions: { kind: 'group', operator: 'and', conditions: [{ kind: 'predicate', fieldId: 'amount', operator: 'gt', value: 50 }] },
+      }],
+      sampleInputs: { amount: 60 }, versions: [], updatedAt: 1000,
+    };
+    const document: WorkspaceDocument = { schemaVersion: 1, projects: [project], activeProjectId: project.id };
+    const repository = new RecoveredRepository({
+      fatal: false,
+      document,
+      legacy: true,
+      issues: [{ scope: 'version', severity: 'warning', message: '版本记录缺少 frozen 字段' }],
+      rawSources: [{ source: 'indexedDb', value: { schemaVersion: undefined } }],
+      skipWriteSources: [],
+    });
+    const workspace = new RuleWorkspaceViewModel(repository, new FakeChecker());
+    await workspace.start();
+    expect(workspace.getSnapshot().recoveryLocked).toBe(true);
+    expect(workspace.getSnapshot().project?.title).toBe('用户项目');
+
+    workspace.renameProject('不应保存的名称');
+    await vi.advanceTimersByTimeAsync(300);
+    expect(workspace.getSnapshot().project?.title).toBe('用户项目');
+    expect(repository.backupPrepared).toBe(false);
+    expect(repository.document).toBeNull();
+
+    await workspace.prepareRecoveryForSave();
+    expect(repository.backupPrepared).toBe(true);
+    workspace.renameProject('已备份后的名称');
+    await vi.advanceTimersByTimeAsync(300);
+    await workspace.flushSave();
+    expect(repository.document?.projects[0].title).toBe('已备份后的名称');
     workspace.dispose();
   });
 

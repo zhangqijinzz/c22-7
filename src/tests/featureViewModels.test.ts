@@ -6,6 +6,7 @@ import { RuleWorkspaceViewModel } from '../viewmodels/workspaceViewModel';
 
 class MemoryRepository {
   async load() { return null; }
+  async prepareRecoveredSourcesForSave() { return undefined; }
   async save() { return undefined; }
 }
 

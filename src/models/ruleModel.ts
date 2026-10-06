@@ -67,6 +67,42 @@ export interface WorkspaceDocument {
   activeProjectId: string;
 }
 
+export type StorageSourceName = 'indexedDb' | 'localStorage';
+export type RecoveryIssueScope = 'workspace' | 'project' | 'field' | 'rule' | 'version' | 'storage';
+
+export interface RecoveryIssue {
+  scope: RecoveryIssueScope;
+  severity: 'warning' | 'error';
+  message: string;
+  source?: StorageSourceName;
+  projectId?: string;
+  itemId?: string;
+}
+
+export interface RawStorageSnapshot {
+  source: StorageSourceName;
+  value: unknown;
+}
+
+export interface RecoveredWorkspace {
+  fatal: false;
+  document: WorkspaceDocument;
+  issues: RecoveryIssue[];
+  legacy: boolean;
+  rawSources: RawStorageSnapshot[];
+  skipWriteSources: StorageSourceName[];
+}
+
+export interface FatalWorkspaceLoad {
+  fatal: true;
+  message: string;
+  issues: RecoveryIssue[];
+  rawSources: RawStorageSnapshot[];
+  skipWriteSources: StorageSourceName[];
+}
+
+export type WorkspaceLoadResult = RecoveredWorkspace | FatalWorkspaceLoad;
+
 export interface ValidationIssue {
   code: string;
   message: string;

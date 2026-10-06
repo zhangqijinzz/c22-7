@@ -5,7 +5,10 @@ import type {
   RuleAnalysis,
   RuleProject,
   SampleEvaluation,
+  StorageSourceName,
   WorkspaceDocument,
+  WorkspaceLoadResult,
+  RecoveryIssue,
 } from '../models/ruleModel';
 import { cloneData, createBlankProject, createDemoWorkspace, createVersionSnapshot, makeId } from '../models/projectFactory';
 import { RuleRepository } from '../repositories/ruleRepository';
@@ -18,13 +21,16 @@ export type CheckStatus = 'idle' | 'scheduled' | 'checking' | 'success' | 'error
 
 export interface WorkspaceState {
   phase: WorkspacePhase;
-  persistence: 'idle' | 'saving' | 'saved' | 'error';
+  persistence: 'idle' | 'saving' | 'saved' | 'error' | 'recovery-locked';
   workspace: WorkspaceDocument | null;
   project: RuleProject | null;
   activeModule: ModuleId;
   checkStatus: CheckStatus;
   analysis: RuleAnalysis | null;
   validationIssues: ReturnType<typeof ruleDomain.validateProject>;
+  recoveryIssues: RecoveryIssue[];
+  recoveryLocked: boolean;
+  fatalLoadError?: string;
   sampleEvaluation: SampleEvaluation | null;
   selectedRuleId?: string;
   notice: string;
@@ -32,14 +38,18 @@ export interface WorkspaceState {
 }
 
 type Listener = () => void;
-type WorkspaceRepository = Pick<RuleRepository, 'load' | 'save'>;
+type WorkspaceRepository = {
+  load(): Promise<WorkspaceLoadResult | WorkspaceDocument | null>;
+  save(document: WorkspaceDocument, options?: { skipSources?: StorageSourceName[] }): Promise<void>;
+  prepareRecoveredSourcesForSave(): Promise<void>;
+};
 type Checker = Pick<RuleCheckService, 'run'>;
 
 export class RuleWorkspaceViewModel implements WorkspacePort {
   private state: WorkspaceState = {
     phase: 'loading', persistence: 'idle', workspace: null, project: null,
     activeModule: 'inspection', checkStatus: 'idle', analysis: null,
-    validationIssues: [], sampleEvaluation: null, notice: '正在恢复本地规则项目…',
+    validationIssues: [], recoveryIssues: [], recoveryLocked: false, sampleEvaluation: null, notice: '正在恢复本地规则项目…',
   };
   private readonly listeners = new Set<Listener>();
   private startPromise?: Promise<void>;
@@ -86,6 +96,10 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
 
   commitProject(project: RuleProject, notice = '项目已更新', options: { recheck?: boolean } = {}): boolean {
     const current = this.state.project;
+    if (this.state.recoveryLocked) {
+      this.updateView({ notice: '检测到本地数据损坏。请先在上方备份原始数据，再保存修改。' });
+      return false;
+    }
     if (!current || current.frozenVersionId) {
       this.updateView({ notice: '当前版本已冻结。请先从版本记录中复制一份继续编辑。' });
       return false;
@@ -154,9 +168,30 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
     }
   }
 
+  async prepareRecoveryForSave(): Promise<void> {
+    if (!this.state.recoveryLocked) return;
+    this.updateView({ persistence: 'saving', saveError: undefined, notice: '正在备份原始数据…' });
+    try {
+      await this.repository.prepareRecoveredSourcesForSave();
+      const workspace = this.state.workspace;
+      this.updateView({
+        recoveryLocked: false,
+        persistence: 'saving',
+        notice: '原始数据已备份，正在保存可恢复的工作区；未识别内容仍保留在备份中。',
+      });
+      if (workspace) this.scheduleSave(workspace);
+    } catch (error) {
+      this.updateView({
+        persistence: 'error',
+        saveError: error instanceof Error ? error.message : '备份原始数据失败',
+        notice: '未能备份原始数据，已继续阻止自动保存',
+      });
+    }
+  }
+
   createProject(): void {
     const workspace = this.state.workspace;
-    if (!workspace) return;
+    if (!workspace || !this.ensureWritable()) return;
     const project = createBlankProject(workspace.projects.length + 1);
     const next: WorkspaceDocument = { ...workspace, projects: [...workspace.projects, project], activeProjectId: project.id };
     this.publish({ ...this.state, workspace: next, project, phase: 'validating', activeModule: 'fields', analysis: null, checkStatus: 'idle', validationIssues: ruleDomain.validateProject(project), sampleEvaluation: evaluateSample(project, project.sampleInputs), selectedRuleId: undefined, notice: '空项目已创建。先定义字段，再添加规则。' });
@@ -166,7 +201,7 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
   switchProject(projectId: string): void {
     const workspace = this.state.workspace;
     const project = workspace?.projects.find((candidate) => candidate.id === projectId);
-    if (!workspace || !project || workspace.activeProjectId === projectId) return;
+    if (!workspace || !project || workspace.activeProjectId === projectId || !this.ensureWritable()) return;
     this.cancelCheck();
     const next = { ...workspace, activeProjectId: projectId };
     const issues = ruleDomain.validateProject(project);
@@ -201,7 +236,7 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
     const workspace = this.state.workspace;
     const source = this.state.project;
     const version = source?.versions.find((candidate) => candidate.id === versionId);
-    if (!workspace || !source || !version) return;
+    if (!workspace || !source || !version || !this.ensureWritable()) return;
     const project: RuleProject = {
       id: makeId('project'), title: `${source.title} · ${version.name}副本`,
       fields: cloneData(version.fields), rules: cloneData(version.rules), sampleInputs: cloneData(version.sampleInputs),
@@ -217,16 +252,45 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
   private async initialize(): Promise<void> {
     this.publish({ ...this.state, phase: 'loading', notice: '正在恢复本地规则项目…' });
     try {
-      const saved = await this.repository.load();
-      const workspace = saved ?? createDemoWorkspace();
-      const project = workspace.projects.find((candidate) => candidate.id === workspace.activeProjectId) ?? workspace.projects[0];
-      const issues = ruleDomain.validateProject(project);
-      this.publish({ ...this.state, workspace, project, phase: issues.length ? 'validating' : 'editing', persistence: saved ? 'saved' : 'saving', activeModule: 'inspection', checkStatus: issues.length ? 'idle' : 'scheduled', validationIssues: issues, analysis: null, sampleEvaluation: evaluateSample(project, project.sampleInputs), selectedRuleId: project.rules[0]?.id, notice: saved ? '已从本地恢复最近项目' : '已载入演示项目，可直接修改并检查规则' });
-      if (saved) this.scheduleCheck(40);
-      else {
+      const saved = await this.repository.load() as WorkspaceLoadResult | WorkspaceDocument | null;
+      if (saved === null) {
+        const workspace = createDemoWorkspace();
+        const project = workspace.projects[0];
+        const issues = ruleDomain.validateProject(project);
+        this.publish({ ...this.state, workspace, project, phase: issues.length ? 'validating' : 'editing', persistence: 'saving', activeModule: 'inspection', checkStatus: issues.length ? 'idle' : 'scheduled', validationIssues: issues, recoveryIssues: [], recoveryLocked: false, fatalLoadError: undefined, analysis: null, sampleEvaluation: evaluateSample(project, project.sampleInputs), selectedRuleId: project.rules[0]?.id, notice: '已载入演示项目，可直接修改并检查规则' });
         this.scheduleSave(workspace);
         if (!issues.length) this.scheduleCheck(40);
+        return;
       }
+
+      if (isFatalLoad(saved)) {
+        this.publish({
+          ...this.state, workspace: null, project: null, phase: 'error', persistence: 'idle',
+          checkStatus: 'error', analysis: null, validationIssues: [],
+          recoveryIssues: saved.issues, recoveryLocked: true, fatalLoadError: saved.message,
+          sampleEvaluation: null, notice: saved.message, saveError: undefined,
+        });
+        return;
+      }
+
+      const recovered = isWorkspaceDocument(saved) ? { document: saved, issues: [], legacy: false } : saved;
+      const workspace = recovered.document;
+      const recoveryLocked = recovered.issues.length > 0 || recovered.legacy;
+      const project = workspace.projects.find((candidate) => candidate.id === workspace.activeProjectId) ?? workspace.projects[0];
+      const issues = ruleDomain.validateProject(project);
+      const notice = recoveryLocked
+        ? `已恢复 ${workspace.projects.length} 个项目；${recovered.issues.length} 项内容无法识别或来自旧版本，原始数据尚未覆盖`
+        : '已从本地恢复最近项目';
+      this.publish({
+        ...this.state, workspace, project,
+        phase: issues.length ? 'validating' : 'editing',
+        persistence: recoveryLocked ? 'recovery-locked' : 'saved',
+        activeModule: 'inspection', checkStatus: issues.length ? 'idle' : 'scheduled',
+        validationIssues: issues, recoveryIssues: recovered.issues, recoveryLocked, fatalLoadError: undefined,
+        analysis: null, sampleEvaluation: evaluateSample(project, project.sampleInputs),
+        selectedRuleId: project.rules[0]?.id, notice, saveError: undefined,
+      });
+      if (!issues.length) this.scheduleCheck(40);
     } catch (error) {
       this.publish({ ...this.state, phase: 'error', notice: error instanceof Error ? error.message : '项目初始化失败' });
     }
@@ -234,7 +298,7 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
 
   private replaceProject(project: RuleProject, notice: string, recheck: boolean, allowFrozen = false): void {
     const workspace = this.state.workspace;
-    if (!workspace) return;
+    if (!workspace || !this.ensureWritable()) return;
     if (this.state.project?.frozenVersionId && !allowFrozen) {
       this.updateView({ notice: '当前版本已冻结。请先从版本记录中复制一份继续编辑。' });
       return;
@@ -254,6 +318,12 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
     this.scheduleSave(next);
     if (recheck && !issues.length) this.scheduleCheck(180);
     else if (issues.length) this.cancelPendingCheck();
+  }
+
+  private ensureWritable(): boolean {
+    if (!this.state.recoveryLocked) return true;
+    this.updateView({ notice: '检测到本地数据损坏。请先在上方备份原始数据，再保存修改。' });
+    return false;
   }
 
   private scheduleCheck(delay: number): void {
@@ -276,6 +346,7 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
   }
 
   private scheduleSave(workspace: WorkspaceDocument): void {
+    if (this.state.recoveryLocked) return;
     const revision = ++this.saveRevision;
     if (this.saveTimer) clearTimeout(this.saveTimer);
     this.publish({ ...this.state, persistence: 'saving', saveError: undefined });
@@ -297,4 +368,12 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
     this.state = state;
     this.listeners.forEach((listener) => listener());
   }
+}
+
+function isFatalLoad(value: WorkspaceLoadResult | WorkspaceDocument): value is Extract<WorkspaceLoadResult, { fatal: true }> {
+  return typeof value === 'object' && value !== null && 'fatal' in value && value.fatal === true;
+}
+
+function isWorkspaceDocument(value: WorkspaceLoadResult | WorkspaceDocument): value is WorkspaceDocument {
+  return typeof value === 'object' && value !== null && !('fatal' in value);
 }
