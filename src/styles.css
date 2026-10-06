@@ -103,6 +103,10 @@ button:disabled { cursor: not-allowed !important; opacity: .5; }
 .status-message-error { color: #b8695f; }
 .status-message-error > span { color: #b8695f; }
 .status-message small { margin-left: auto; color: #b8695f; }
+.status-message-warn { align-items: flex-start; color: #9a7b3f; }
+.status-message-warn > span { color: #b08a3e; }
+.restore-notice-copy ul { margin: 2px 0 0; padding-left: 14px; }
+.restore-notice-dismiss { margin-left: auto; border: 0; background: transparent; color: #b08a3e; font-size: 11px; cursor: pointer; }
 .module-tabs { display: flex; align-items: stretch; gap: 4px; min-height: 41px; margin-top: 1px; border-bottom: 1px solid #e3ebe7; }
 .module-tab { position: relative; display: inline-flex; align-items: center; gap: 7px; min-width: 132px; padding: 0 13px; border: 0; border-radius: 6px 6px 0 0; background: transparent; color: #87958f; font-size: 9px; font-weight: 600; cursor: pointer; }
 .module-tab:hover { background: #f0f5f1; color: #5d796b; }

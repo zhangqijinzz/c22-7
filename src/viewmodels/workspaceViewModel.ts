@@ -28,6 +28,7 @@ export interface WorkspaceState {
   sampleEvaluation: SampleEvaluation | null;
   selectedRuleId?: string;
   notice: string;
+  restoreNotices: string[];
   saveError?: string;
 }
 
@@ -39,7 +40,7 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
   private state: WorkspaceState = {
     phase: 'loading', persistence: 'idle', workspace: null, project: null,
     activeModule: 'inspection', checkStatus: 'idle', analysis: null,
-    validationIssues: [], sampleEvaluation: null, notice: '正在恢复本地规则项目…',
+    validationIssues: [], sampleEvaluation: null, notice: '正在恢复本地规则项目…', restoreNotices: [],
   };
   private readonly listeners = new Set<Listener>();
   private startPromise?: Promise<void>;
@@ -217,13 +218,25 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
   private async initialize(): Promise<void> {
     this.publish({ ...this.state, phase: 'loading', notice: '正在恢复本地规则项目…' });
     try {
-      const saved = await this.repository.load();
-      const workspace = saved ?? createDemoWorkspace();
+      const outcome = await this.repository.load();
+      if (outcome.status === 'unreadable') {
+        // Keep workspace and project null so no edit path can schedule a save:
+        // the unreadable local data must stay untouched on disk.
+        this.publish({ ...this.state, phase: 'error', workspace: null, project: null, persistence: 'idle', restoreNotices: [], notice: `无法读取本地保存的规则项目（${outcome.reason}）。为保护数据已停止自动保存，原有内容不会被覆盖，请备份或清理浏览器存储后再试。` });
+        return;
+      }
+      const restored = outcome.status === 'loaded';
+      const workspace = restored ? outcome.workspace : createDemoWorkspace();
+      const repairs = restored ? outcome.repairs : [];
       const project = workspace.projects.find((candidate) => candidate.id === workspace.activeProjectId) ?? workspace.projects[0];
       const issues = ruleDomain.validateProject(project);
-      this.publish({ ...this.state, workspace, project, phase: issues.length ? 'validating' : 'editing', persistence: saved ? 'saved' : 'saving', activeModule: 'inspection', checkStatus: issues.length ? 'idle' : 'scheduled', validationIssues: issues, analysis: null, sampleEvaluation: evaluateSample(project, project.sampleInputs), selectedRuleId: project.rules[0]?.id, notice: saved ? '已从本地恢复最近项目' : '已载入演示项目，可直接修改并检查规则' });
-      if (saved) this.scheduleCheck(40);
-      else {
+      const notice = restored
+        ? repairs.length ? '已从本地恢复最近项目，部分无法识别的内容已跳过' : '已从本地恢复最近项目'
+        : '已载入演示项目，可直接修改并检查规则';
+      this.publish({ ...this.state, workspace, project, phase: issues.length ? 'validating' : 'editing', persistence: restored ? 'saved' : 'saving', activeModule: 'inspection', checkStatus: issues.length ? 'idle' : 'scheduled', validationIssues: issues, analysis: null, sampleEvaluation: evaluateSample(project, project.sampleInputs), selectedRuleId: project.rules[0]?.id, notice, restoreNotices: repairs });
+      if (restored) {
+        if (!issues.length) this.scheduleCheck(40);
+      } else {
         this.scheduleSave(workspace);
         if (!issues.length) this.scheduleCheck(40);
       }

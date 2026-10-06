@@ -48,6 +48,7 @@ export default function App() {
         {project && <div className="content-wrap">
           <div className="project-title-bar"><div className="project-title-copy"><span className="project-kicker">RULE PROJECT / LOCAL</span><input aria-label="项目名称" value={project.title} onChange={(event) => workspace.renameProject(event.target.value)} /><span className="project-subtitle">规则逻辑空间 <span>·</span> 最后修改 {new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(project.updatedAt)}</span></div><div className="title-bar-actions"><span className={`phase-badge phase-${state.phase}`}>{state.phase === 'checking' ? '检查中' : state.phase === 'validating' ? '需要修复' : state.phase === 'error' ? '发生错误' : project.frozenVersionId ? '已冻结' : state.phase === 'ready' ? '检查通过' : '编辑中'}</span><button className="title-more-button" aria-label="创建项目" title="新建项目" onClick={() => workspace.createProject()}>＋</button></div></div>
           {state.notice && <div className={`status-message${state.phase === 'error' ? ' status-message-error' : ''}`} role="status"><span>{state.phase === 'error' ? '!' : '↳'}</span>{state.notice}{state.saveError && <small>{state.saveError}</small>}</div>}
+          {state.restoreNotices.length > 0 && <div className="status-message status-message-warn" role="alert"><span>!</span><div className="restore-notice-copy"><strong>以下本地内容无法识别，已跳过（其余数据已正常恢复）：</strong><ul>{state.restoreNotices.map((item) => <li key={item}>{item}</li>)}</ul></div><button className="restore-notice-dismiss" aria-label="不再提示" onClick={() => workspace.updateView({ restoreNotices: [] })}>×</button></div>}
           <div className="module-tabs" role="tablist" aria-label="规则项目功能模块">
             {navigation.map((item, index) => <button id={`module-tab-${item.id}`} key={item.id} role="tab" aria-selected={state.activeModule === item.id} aria-controls="module-panel" tabIndex={state.activeModule === item.id ? 0 : -1} className={`module-tab${state.activeModule === item.id ? ' module-tab-active' : ''}`} onClick={() => workspace.navigate(item.id)} onKeyDown={(event) => {
               if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft') return;
@@ -65,7 +66,9 @@ export default function App() {
             {state.activeModule === 'inspection' && <InspectionView state={state} viewModel={inspection} onOpenRule={openRule} />}
           </div>
         </div>}
-        {!project && <div className="startup-state"><div className="spinner" /><strong>正在加载 RuleWeave</strong><span>读取本地项目与版本快照</span></div>}
+        {!project && (state.phase === 'error'
+          ? <div className="startup-state"><strong>无法打开本地工作区</strong><span>{state.notice}</span></div>
+          : <div className="startup-state"><div className="spinner" /><strong>正在加载 RuleWeave</strong><span>读取本地项目与版本快照</span></div>)}
       </main>
     </div>
   );

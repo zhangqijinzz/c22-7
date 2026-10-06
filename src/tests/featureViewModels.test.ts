@@ -5,7 +5,7 @@ import { SamplesViewModel } from '../features/samples/samplesViewModel';
 import { RuleWorkspaceViewModel } from '../viewmodels/workspaceViewModel';
 
 class MemoryRepository {
-  async load() { return null; }
+  async load() { return { status: 'empty' as const }; }
   async save() { return undefined; }
 }
 

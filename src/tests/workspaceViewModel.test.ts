@@ -1,13 +1,30 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { analyzeRules } from '../domain/ruleAnalysis';
 import type { RuleProject, WorkspaceDocument } from '../models/ruleModel';
+import { RuleRepository, type WorkspaceLoadOutcome } from '../repositories/ruleRepository';
+import { ProjectStorageService } from '../services/projectStorageService';
 import type { CheckOperation } from '../services/ruleCheckService';
 import { RuleWorkspaceViewModel } from '../viewmodels/workspaceViewModel';
 
 class MemoryRepository {
   document: WorkspaceDocument | null = null;
-  async load() { return this.document ? structuredClone(this.document) : null; }
-  async save(document: WorkspaceDocument) { this.document = structuredClone(document); }
+  outcome?: WorkspaceLoadOutcome;
+  savedCount = 0;
+  async load(): Promise<WorkspaceLoadOutcome> {
+    if (this.outcome) return this.outcome;
+    return this.document
+      ? { status: 'loaded', workspace: structuredClone(this.document), repairs: [] }
+      : { status: 'empty' };
+  }
+  async save(document: WorkspaceDocument) { this.savedCount += 1; this.document = structuredClone(document); }
+}
+
+class FakeStorage extends ProjectStorageService {
+  stored: unknown = null;
+  written: WorkspaceDocument[] = [];
+  override async read() { return this.stored; }
+  override readFallback() { return null; }
+  override async write(document: WorkspaceDocument) { this.written.push(structuredClone(document)); }
 }
 
 class FakeChecker {
@@ -99,6 +116,86 @@ describe('RuleWorkspaceViewModel', () => {
     workspace.copyVersionToProject(savedVersion?.id ?? '');
     expect(workspace.getSnapshot().workspace?.projects).toHaveLength(2);
     expect(workspace.getSnapshot().project?.fields).toHaveLength(3);
+    workspace.dispose();
+  });
+
+  it('recovers intact entries around a corrupt version record and never overwrites the stored data', async () => {
+    const storage = new FakeStorage();
+    storage.stored = {
+      schemaVersion: 1,
+      activeProjectId: 'project-a',
+      projects: [
+        {
+          id: 'project-a', title: '策略 A', updatedAt: 100,
+          fields: [{ id: 'amount', name: '金额', type: 'number', min: 0, max: 100 }],
+          rules: [{ id: 'rule-a', name: '大额', priority: 1, result: '审核', conditions: { kind: 'group', operator: 'and', conditions: [{ kind: 'predicate', fieldId: 'amount', operator: 'gte', value: 50 }] } }],
+          sampleInputs: { amount: 80 },
+          versions: [
+            { id: 'version-broken', name: '缺字段的快照' },
+            { id: 'version-ok', name: '完好快照', savedAt: 90, frozen: true, fields: [{ id: 'amount', name: '金额', type: 'number', min: 0, max: 100 }], rules: [], sampleInputs: {} },
+          ],
+        },
+        { id: 'project-b', title: '策略 B', updatedAt: 200, fields: [], rules: [], sampleInputs: {}, versions: [] },
+      ],
+    };
+    const workspace = new RuleWorkspaceViewModel(new RuleRepository(storage), new FakeChecker());
+    await workspace.start();
+    await vi.advanceTimersByTimeAsync(500);
+    await workspace.flushSave();
+
+    const state = workspace.getSnapshot();
+    expect(state.workspace?.projects.map((project) => project.id)).toEqual(['project-a', 'project-b']);
+    expect(state.project?.versions.map((version) => version.id)).toEqual(['version-ok']);
+    expect(state.restoreNotices.some((item) => item.includes('无法识别') && item.includes('版本记录'))).toBe(true);
+    expect(storage.written).toHaveLength(0);
+    workspace.dispose();
+  });
+
+  it('reports unreadable local data and blocks all saves instead of seeding the demo project', async () => {
+    const storage = new FakeStorage();
+    storage.stored = { schemaVersion: 1, projects: 'corrupted-by-hand', activeProjectId: 'project-a' };
+    const workspace = new RuleWorkspaceViewModel(new RuleRepository(storage), new FakeChecker());
+    await workspace.start();
+    await vi.advanceTimersByTimeAsync(500);
+    await workspace.flushSave();
+
+    const state = workspace.getSnapshot();
+    expect(state.phase).toBe('error');
+    expect(state.project).toBeNull();
+    expect(state.workspace).toBeNull();
+    expect(state.notice).toContain('不会被覆盖');
+    expect(storage.written).toHaveLength(0);
+    workspace.dispose();
+  });
+
+  it('does not save when the repository reports unreadable data', async () => {
+    const repository = new MemoryRepository();
+    repository.outcome = { status: 'unreadable', reason: '存储内容不是可识别的规则工作区' };
+    const workspace = new RuleWorkspaceViewModel(repository, new FakeChecker());
+    await workspace.start();
+    await vi.advanceTimersByTimeAsync(500);
+    await workspace.flushSave();
+    expect(workspace.getSnapshot().phase).toBe('error');
+    expect(repository.savedCount).toBe(0);
+    workspace.dispose();
+  });
+
+  it('restores a repaired workspace with a skip summary and schedules no save', async () => {
+    const repository = new MemoryRepository();
+    const document: WorkspaceDocument = {
+      schemaVersion: 1,
+      activeProjectId: 'project-a',
+      projects: [{ id: 'project-a', title: '策略 A', fields: [], rules: [], sampleInputs: {}, versions: [], updatedAt: 1 }],
+    };
+    repository.outcome = { status: 'loaded', workspace: document, repairs: ['项目「策略 A」：已跳过 2 条无法识别的规则'] };
+    const workspace = new RuleWorkspaceViewModel(repository, new FakeChecker());
+    await workspace.start();
+    await vi.advanceTimersByTimeAsync(500);
+    await workspace.flushSave();
+    expect(workspace.getSnapshot().restoreNotices).toEqual(['项目「策略 A」：已跳过 2 条无法识别的规则']);
+    expect(workspace.getSnapshot().notice).toContain('部分无法识别的内容已跳过');
+    expect(workspace.getSnapshot().persistence).toBe('saved');
+    expect(repository.savedCount).toBe(0);
     workspace.dispose();
   });
 });

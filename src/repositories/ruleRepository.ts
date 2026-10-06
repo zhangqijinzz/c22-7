@@ -2,12 +2,38 @@ import type { BusinessRule, RuleField, RuleProject, RuleVersion, WorkspaceDocume
 import { defaultSample } from '../domain/conditionEvaluator';
 import { ProjectStorageService } from '../services/projectStorageService';
 
+export type WorkspaceLoadOutcome =
+  | { status: 'empty' }
+  | { status: 'loaded'; workspace: WorkspaceDocument; repairs: string[] }
+  | { status: 'unreadable'; reason: string };
+
+interface WorkspaceDecode {
+  workspace: WorkspaceDocument;
+  repairs: string[];
+}
+
+interface ProjectDecode {
+  project: RuleProject;
+  repairs: string[];
+}
+
 export class RuleRepository {
   constructor(private readonly storage: ProjectStorageService) {}
 
-  async load(): Promise<WorkspaceDocument | null> {
-    const indexedDbValue = await this.storage.read();
-    return decodeWorkspace(indexedDbValue) ?? decodeWorkspace(this.storage.readFallback());
+  async load(): Promise<WorkspaceLoadOutcome> {
+    const candidates: unknown[] = [await this.storage.read(), this.storage.readFallback()];
+    let sawStoredValue = false;
+    for (const candidate of candidates) {
+      if (candidate === null || candidate === undefined) continue;
+      sawStoredValue = true;
+      const decoded = decodeWorkspace(candidate);
+      if (decoded) return { status: 'loaded', workspace: decoded.workspace, repairs: decoded.repairs };
+    }
+    // Stored content exists but nothing could be decoded: report it instead of
+    // letting the caller reseed the demo project over the user's data.
+    return sawStoredValue
+      ? { status: 'unreadable', reason: '存储内容不是可识别的规则工作区' }
+      : { status: 'empty' };
   }
 
   save(document: WorkspaceDocument): Promise<void> {
@@ -15,37 +41,64 @@ export class RuleRepository {
   }
 }
 
-function decodeWorkspace(value: unknown): WorkspaceDocument | null {
-  if (!isRecord(value) || value.schemaVersion !== 1 || !Array.isArray(value.projects) || typeof value.activeProjectId !== 'string') return null;
+function decodeWorkspace(value: unknown): WorkspaceDecode | null {
+  if (!isRecord(value) || value.schemaVersion !== 1 || !Array.isArray(value.projects)) return null;
+  const repairs: string[] = [];
   const projects: RuleProject[] = [];
-  for (const valueProject of value.projects) {
-    const project = decodeProject(valueProject);
-    if (!project) return null;
-    projects.push(project);
+  value.projects.forEach((valueProject, index) => {
+    const decoded = decodeProject(valueProject);
+    if (!decoded) {
+      repairs.push(`已跳过 1 个无法识别的项目（${describeProject(valueProject, index)}）`);
+      return;
+    }
+    projects.push(decoded.project);
+    repairs.push(...decoded.repairs);
+  });
+  if (!projects.length) return null;
+  const storedActiveId = typeof value.activeProjectId === 'string' ? value.activeProjectId : '';
+  let activeProjectId = storedActiveId;
+  if (!projects.some((project) => project.id === activeProjectId)) {
+    repairs.push(`原活动项目已不可用，已切换到「${projects[0].title}」`);
+    activeProjectId = projects[0].id;
   }
-  if (!projects.length || !projects.some((project) => project.id === value.activeProjectId)) return null;
-  return { schemaVersion: 1, projects, activeProjectId: value.activeProjectId };
+  return { workspace: { schemaVersion: 1, projects, activeProjectId }, repairs };
 }
 
-function decodeProject(value: unknown): RuleProject | null {
-  if (!isRecord(value) || typeof value.id !== 'string' || typeof value.title !== 'string' || !Array.isArray(value.fields) || !Array.isArray(value.rules) || typeof value.updatedAt !== 'number') return null;
-  const fields = value.fields.filter(isRuleField);
-  const rules = value.rules.filter(isBusinessRule);
-  if (fields.length !== value.fields.length || rules.length !== value.rules.length) return null;
+function decodeProject(value: unknown): ProjectDecode | null {
+  if (!isRecord(value) || typeof value.id !== 'string' || !value.id) return null;
+  const repairs: string[] = [];
+  const title = typeof value.title === 'string' && value.title ? value.title : '未命名项目';
+  const label = `项目「${title}」`;
+  const fieldsValue = Array.isArray(value.fields) ? value.fields : [];
+  const fields = fieldsValue.filter(isRuleField);
+  if (fields.length !== fieldsValue.length) repairs.push(`${label}：已跳过 ${fieldsValue.length - fields.length} 个无法识别的字段`);
+  const rulesValue = Array.isArray(value.rules) ? value.rules : [];
+  const rules = rulesValue.filter(isBusinessRule);
+  if (rules.length !== rulesValue.length) repairs.push(`${label}：已跳过 ${rulesValue.length - rules.length} 条无法识别的规则`);
   const versionsValue = Array.isArray(value.versions) ? value.versions : [];
   const versions = versionsValue.filter(isRuleVersion);
-  if (versions.length !== versionsValue.length) return null;
+  if (versions.length !== versionsValue.length) repairs.push(`${label}：已跳过 ${versionsValue.length - versions.length} 条无法识别的版本记录`);
   const project: RuleProject = {
     id: value.id,
-    title: value.title,
+    title,
     fields,
     rules,
     sampleInputs: isRecord(value.sampleInputs) ? value.sampleInputs as RuleProject['sampleInputs'] : defaultSample(fields),
     versions,
-    updatedAt: value.updatedAt,
+    updatedAt: typeof value.updatedAt === 'number' ? value.updatedAt : 0,
   };
-  if (typeof value.frozenVersionId === 'string') project.frozenVersionId = value.frozenVersionId;
-  return project;
+  if (typeof value.frozenVersionId === 'string') {
+    if (versions.some((version) => version.id === value.frozenVersionId)) {
+      project.frozenVersionId = value.frozenVersionId;
+    } else {
+      repairs.push(`${label}：冻结指向的版本记录已损坏，已解除冻结状态`);
+    }
+  }
+  return { project, repairs };
+}
+
+function describeProject(value: unknown, index: number): string {
+  return isRecord(value) && typeof value.title === 'string' && value.title ? `「${value.title}」` : `第 ${index + 1} 条记录`;
 }
 
 function isRuleField(value: unknown): value is RuleField {
